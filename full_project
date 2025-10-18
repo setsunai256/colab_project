@@ -277,7 +277,7 @@ import time
 
 nest_asyncio.apply()
 
-NGROK_AUTH_TOKEN = "2uG4ac0QqJ1CE2qt01kr1qFtMM4_7GMQsrgCZDxWUhLrWFN6R"
+NGROK_AUTH_TOKEN = "YOUR_TOKEN" // Вставьте свой токен Ngrok
 ngrok.set_auth_token(NGROK_AUTH_TOKEN)
 public_url = ngrok.connect(5000)
 print(f"Ngrok tunnel: {public_url}")
