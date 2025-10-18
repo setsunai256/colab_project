@@ -1,0 +1,295 @@
+!pip install flask python-docx python-pptx pyngrok --quiet
+!pip install -U diffusers transformers accelerate safetensors
+
+import os
+
+os.makedirs("templates", exist_ok=True)
+os.makedirs("static", exist_ok=True)
+os.makedirs("docs", exist_ok=True)
+
+# app.py
+app_py = """
+from flask import Flask, render_template, request, jsonify, send_from_directory
+from transformers import AutoModel, AutoTokenizer
+from diffusers import StableDiffusionPipeline
+import torch
+import traceback
+import os
+from generator import generate_report
+import socket
+
+app = Flask(__name__)
+
+try:
+    print("Загрузка языковой модели...")
+    path = 'OpenGVLab/InternVL2_5-4B'
+    model = AutoModel.from_pretrained(
+        path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+        trust_remote_code=True, device_map="auto", max_memory={0: "15GB"}
+    ).half().eval().cuda()
+    tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
+    generation_config = dict(max_new_tokens=1024, do_sample=True)
+
+    print("Загрузка модели Stable Diffusion...")
+    model_id = "stabilityai/stable-diffusion-2-1-base"
+    pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
+    pipe = pipe.to("cuda")
+    print("Все модели загружены успешно!")
+except Exception as e:
+    print("Ошибка при загрузке моделей:", e)
+    print(traceback.format_exc())
+
+
+def find_free_port(start_port=5000, max_port=5100):
+    for port in range(start_port, max_port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("0.0.0.0", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError("Нет свободных портов в диапазоне")
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/generate", methods=["POST"])
+def generate():
+    topic = request.form.get("topic", "").strip()
+    if not topic:
+        return jsonify({"message": "Ошибка: тема не может быть пустой."})
+
+    try:
+        doc_path, ppt_path = generate_report(topic, model, tokenizer, generation_config, pipe)
+        if not doc_path or not ppt_path:
+            return jsonify({"message": "Ошибка при генерации отчёта."})
+
+        doc_link = "/docs/" + os.path.basename(doc_path)
+        ppt_link = "/docs/" + os.path.basename(ppt_path)
+
+        return jsonify({"message": "Успешно", "doc": doc_link, "ppt": ppt_link})
+    except Exception as e:
+        return jsonify({"message": f"Ошибка: {str(e)}"})
+
+
+@app.route('/docs/<path:filename>')
+def download_file(filename):
+    return send_from_directory('docs', filename, as_attachment=True)
+
+
+if __name__ == "__main__":
+    port = find_free_port(5050, 5100)
+    print(f"Запуск сервера на порту {port}")
+    app.run(port=port)
+"""
+
+with open("app.py", "w", encoding="utf-8") as f:
+    f.write(app_py)
+
+
+# generator.py
+generator_py = """
+from docx import Document
+from pptx import Presentation
+from pptx.util import Inches, Pt, Cm
+from pptx.enum.text import PP_ALIGN
+from pptx.dml.color import RGBColor as PPTX_RGBColor
+from docx.shared import RGBColor
+from docx.oxml.ns import qn
+import os
+import traceback
+from transformers import CLIPTokenizer
+
+# Токенизатор CLIP для ограничения длины prompt
+clip_tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+
+def truncate_prompt(prompt: str, max_tokens: int = 77):
+    tokens = clip_tokenizer(prompt)["input_ids"]
+    if len(tokens) > max_tokens:
+        truncated = clip_tokenizer.decode(tokens[:max_tokens], skip_special_tokens=True)
+        return truncated
+    return prompt
+
+def generate_report(topic, model, tokenizer, generation_config, pipe):
+    if not topic:
+        return None, None
+    try:
+        os.makedirs("docs/images", exist_ok=True)
+
+        sections = ['Введение', 'Заключение']
+        question = f'Придумай от 2 до 3 кратких, четких и конкретных названий основных разделов для доклада на тему "{topic}". Ответ должен содержать только названия разделов, каждое с новой строки.'
+        response, _ = model.chat(tokenizer, None, question, generation_config, history=None, return_history=True)
+        additional_sections = [s.strip() for s in response.split('\\n') if s.strip()]
+        sections[1:1] = additional_sections
+
+        doc = Document()
+        style = doc.styles['Normal']
+        style.font.name = 'Times New Roman'
+        style.element.rPr.rFonts.set(qn('w:eastAsia'), 'Times New Roman')
+        style.font.size = Pt(14)
+        style.paragraph_format.first_line_indent = Cm(1.25)
+        style.paragraph_format.line_spacing = 1.5
+        style.paragraph_format.space_after = Pt(0)
+
+        prs = Presentation()
+        title_slide = prs.slides.add_slide(prs.slide_layouts[0])
+        title_slide.shapes.title.text = topic
+
+        for section in sections:
+            question = f'Напиши развернутый текст для раздела "{section}" доклада на тему "{topic}".'
+            response, _ = model.chat(tokenizer, None, question, generation_config, history=None, return_history=True)
+            response = response.strip() or f'Раздел "{section}" временно не заполнен.'
+
+            heading = doc.add_heading(section, level=1)
+            run = heading.runs[0]
+            run.font.name = 'Times New Roman'
+            run.font.bold = True
+            run.font.size = Pt(16)
+            run.font.color.rgb = RGBColor(0, 0, 0)
+            heading.alignment = PP_ALIGN.CENTER
+
+            paragraph = doc.add_paragraph(response)
+            paragraph.alignment = PP_ALIGN.JUSTIFY
+
+            slide_question = f'Сформулируй тезисный текст для слайда раздела "{section}" доклада на тему "{topic}". Не более 5 коротких пунктов.'
+            slide_response, _ = model.chat(tokenizer, None, slide_question, generation_config, history=None, return_history=True)
+            slide_response = slide_response.strip()
+
+            prompt_question = f'Generate a detailed and visually descriptive prompt in English for an image related to the section "{section}" of the report on the topic "{topic}".'
+            image_prompt, _ = model.chat(tokenizer, None, prompt_question, generation_config, history=None, return_history=True)
+            image_prompt = truncate_prompt(image_prompt)
+
+            image = pipe(image_prompt).images[0]
+            image_path = f"docs/images/{section.replace(' ', '_')}.png"
+            image.save(image_path)
+
+            slide = prs.slides.add_slide(prs.slide_layouts[5])
+            slide.shapes.title.text = section
+
+            textbox = slide.shapes.add_textbox(Inches(0.5), Inches(1.5), Inches(4.5), Inches(4.5))
+            text_frame = textbox.text_frame
+            text_frame.text = slide_response if slide_response else 'Тезисы отсутствуют.'
+
+            slide.shapes.add_picture(image_path, Inches(5.5), Inches(1.5), width=Inches(4), height=Inches(4.5))
+
+        final_slide = prs.slides.add_slide(prs.slide_layouts[1])
+        final_slide.shapes.title.text = "Спасибо за внимание!"
+        final_slide.shapes.placeholders[1].text = "Буду рад ответить на ваши вопросы."
+
+        doc_name = f"docs/Доклад_{topic.replace(' ', '_')}.docx"
+        ppt_name = f"docs/Презентация_{topic.replace(' ', '_')}.pptx"
+        doc.save(doc_name)
+        prs.save(ppt_name)
+
+        return doc_name, ppt_name
+
+    except Exception as e:
+        print("Ошибка в generate_report:", e)
+        print(traceback.format_exc())
+        return None, None
+
+"""
+
+with open("generator.py", "w", encoding="utf-8") as f:
+    f.write(generator_py)
+
+
+# templates/index.html
+index_html = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Создание доклада и презентации</title>
+</head>
+<body>
+  <h1>Создание доклада и презентации</h1>
+  <input type="text" id="topic" placeholder="Введите тему" />
+  <button onclick="generate()">Сгенерировать</button>
+
+  <!-- Статус и ссылки -->
+  <div id="status" style="margin-top:10px;"></div>
+  <a id="doc-link" href="#" style="display:none; margin-right: 10px;" download></a>
+  <a id="ppt-link" href="#" style="display:none;" download></a>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
+
+"""
+
+with open("templates/index.html", "w", encoding="utf-8") as f:
+    f.write(index_html)
+
+
+# static/script.js
+script_js = """
+async function generate() {
+  const statusEl = document.getElementById("status");
+  const docLink = document.getElementById("doc-link");
+  const pptLink = document.getElementById("ppt-link");
+
+  // Показываем сообщение о загрузке
+  statusEl.textContent = "Идет генерация, это может занять некоторое время...";
+  docLink.style.display = "none";
+  pptLink.style.display = "none";
+
+  const topic = document.getElementById("topic").value;
+  try {
+    const response = await fetch("/generate", {
+      method: "POST",
+      body: new URLSearchParams({ topic }),
+    });
+    const data = await response.json();
+
+    if (data.message === "Успешно") {
+      statusEl.textContent = "Генерация завершена! Скачайте файлы ниже.";
+      docLink.href = data.doc;
+      pptLink.href = data.ppt;
+      docLink.textContent = "Скачать DOCX";
+      pptLink.textContent = "Скачать PPTX";
+      docLink.style.display = "inline";
+      pptLink.style.display = "inline";
+    } else {
+      statusEl.textContent = "";
+      alert(data.message);
+    }
+  } catch (e) {
+    statusEl.textContent = "";
+    alert("Ошибка при соединении с сервером.");
+  }
+}
+
+"""
+
+os.makedirs("static", exist_ok=True)
+with open("static/script.js", "w", encoding="utf-8") as f:
+    f.write(script_js)
+
+from pyngrok import ngrok
+from app import app
+import nest_asyncio
+import threading
+import time
+
+nest_asyncio.apply()
+
+NGROK_AUTH_TOKEN = "2uG4ac0QqJ1CE2qt01kr1qFtMM4_7GMQsrgCZDxWUhLrWFN6R"
+ngrok.set_auth_token(NGROK_AUTH_TOKEN)
+public_url = ngrok.connect(5000)
+print(f"Ngrok tunnel: {public_url}")
+
+def run():
+    app.run()
+
+thread = threading.Thread(target=run)
+thread.start()
+
+try:
+    while True:
+        time.sleep(10)
+except KeyboardInterrupt:
+    print("Сервер остановлен")
