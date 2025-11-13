@@ -10,13 +10,13 @@
 
 Технологии:
 
--Python 3.9+
--Flask
--Transformers
--Diffusers
--python-docx, python-pptx
--ngrok
--Google Colab
+- Python 3.9+
+- Flask
+- Transformers
+- Diffusers
+- python-docx, python-pptx
+- ngrok
+- Google Colab
 
 Быстрый запуск
 
